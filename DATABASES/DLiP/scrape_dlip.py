@@ -16,17 +16,6 @@ MAX_RETRIES = 3
 BACKOFF = 5
 MAX_WORKERS = 10
 
-# ---------- FIELDS ----------
-COLUMNS = [
-    "DLiP-ID", "DLiP-Mol-ID", "Vendor-ID",
-    "Standard Inchi(RDKit)", "Standard Inchi Key(RDKit)",
-    "Canonical SMILES(RDKit)", "SMILES(SDF)",
-    "PPI Type(SDF)", "PDB ID(SDF)", "Receptor Chain(SDF)",
-    "Protein Name Receptor(SDF)", "Peptide Chain(SDF)",
-    "Protein Name Peptide(SDF)",
-    "error"
-]
-
 # ---------- BASE36 HELPERS ----------
 def int_to_base36(n: int) -> str:
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -40,13 +29,31 @@ def int_to_base36(n: int) -> str:
 
 def generate_ids(num=None):
     start = int("00000", 36)
-    end   = int("00BQL", 36)
+    end   = int("00BQL", 36)  # inclusive
     count = 0
     for i in range(start, end + 1):
         if num is not None and count >= num:
             break
         yield f"D{int_to_base36(i).zfill(5)}"
         count += 1
+
+# ---------- FIELDS ----------
+FIELDS = [
+    "DLiP-ID","DLiP-Mol-ID","Vendor-ID",
+    "Standard Inchi(RDKit)","Standard Inchi Key(RDKit)","Canonical SMILES(RDKit)",
+    "SMILES(SDF)","MW(SDF)","MW(RDKit)","MW Monoisotopic(RDKit)","MolLogP(RDKit)",
+    "XLogP(SDF)","XLogP(CDK)","ALogP(SDF)","Num H Acceptors(SDF)","nHAcceptors(SDF)",
+    "HBA(RDKit)","HBA Lipinski(RDKit)","Num H Donors(SDF)","nHDonors(SDF)",
+    "HBD(RDKit)","HBD Lipinski(RDKit)","PSA(SDF)","PSA(RDKit)","RO3 Pass",
+    "Num RO5 Violations","Num Lipinski RO5 Violations","nBonds(SDF)","nRigidBonds(SDF)",
+    "nRotatableBonds(SDF)","nRotatableBonds(RDKit)","nRings(SDF)","nRings(RDKit)",
+    "Aromatic Rings(RDKit)","nAtoms(SDF)","Heavy Atoms(RDKit)","QED Weighted(RDKit)",
+    "Molecular Formula(SDF)","PPI Type(SDF)","PDB ID(SDF)","Receptor Chain(SDF)",
+    "Protein Name Receptor(SDF)","Peptide Chain(SDF)","Protein Name Peptide(SDF)",
+    "ELM ID(SDF)","Motif Sequence(SDF)","Physical Form Apperance(SDF)",
+    "Quantity of Sample mg(SDF)","Box Num(SDF)","Box Position(SDF)","fCsp3(SDF)",
+    "nCarbons(SDF)","nHetAtoms(SDF)","nHalide(SDF)","Year(SDF)","error"
+]
 
 # ---------- SCRAPER ----------
 def scrape_compound(cid, max_retries=MAX_RETRIES, backoff=BACKOFF):
@@ -58,36 +65,38 @@ def scrape_compound(cid, max_retries=MAX_RETRIES, backoff=BACKOFF):
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # collect <td> label-value pairs
-            data = {}
-            tds = soup.find_all("td")
-            for i in range(0, len(tds), 2):
-                key = tds[i].get_text(strip=True)
-                val = tds[i+1].get_text(strip=True) if i+1 < len(tds) else ""
-                data[key] = val
+            data = {field: None for field in FIELDS}
+            data["DLiP-ID"] = cid
 
-            result = {col: data.get(col) for col in COLUMNS if col != "error"}
-            result["error"] = None
-            return result
+            rows = soup.find_all("tr")
+            for tr in rows:
+                tds = tr.find_all("td")
+                if len(tds) != 2:
+                    continue
+                key = tds[0].get_text(strip=True)
+                if key not in FIELDS:
+                    continue
+                if key == "PDB ID(SDF)":
+                    a = tds[1].find("a")
+                    data[key] = a.get_text(strip=True) if a else tds[1].get_text(strip=True)
+                else:
+                    data[key] = tds[1].get_text(strip=True)
+
+            data["error"] = None
+            return data
 
         except Exception as e:
             attempt += 1
             if attempt < max_retries:
                 time.sleep(backoff * attempt)
             else:
-                result = {col: None for col in COLUMNS[:-1]}
-                result["error"] = str(e)
-                return result
+                return {"DLiP-ID": cid, "error": str(e)}
 
 # ---------- STORAGE ----------
 if os.path.exists(PKL_FILE):
     df = pd.read_pickle(PKL_FILE)
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[COLUMNS]
 else:
-    df = pd.DataFrame(columns=COLUMNS)
+    df = pd.DataFrame(columns=FIELDS)
 
 # ---------- ARGPARSE ----------
 parser = argparse.ArgumentParser()
@@ -108,11 +117,20 @@ def flush_batch():
     if not batch_results:
         return
     new_df = pd.DataFrame(batch_results)
+    new_cols = [col for col in new_df.columns if col not in df.columns]
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(columns=new_cols)], ignore_index=True)
+    missing_in_new = [col for col in df.columns if col not in new_df.columns]
+    if missing_in_new:
+        new_df = pd.concat([new_df, pd.DataFrame(columns=missing_in_new)], ignore_index=True)
     df = pd.concat([df[~df["DLiP-ID"].isin(new_df["DLiP-ID"])], new_df], ignore_index=True)
-    df.sort_values("DLiP-ID", inplace=True)
-    df.to_csv(TSV_FILE, sep="\t", index=False)   # <-- Tab-separated output
+    
+    # Sort before saving
+    df = df.sort_values(by="DLiP-ID").reset_index(drop=True)
+    
+    df.to_csv(TSV_FILE, sep="\t", index=False)
     df.to_pickle(PKL_FILE)
-    batch_results = []
+    batch_results.clear()
 
 # ---------- MAIN LOOP ----------
 try:
@@ -122,15 +140,12 @@ try:
             result = f.result()
             result["DLiP-ID"] = futures[f]
             batch_results.append(result)
-
             if result["error"]:
                 tqdm.write(f"{result['DLiP-ID']} FAILED: {result['error']}")
             else:
                 tqdm.write(f"{result['DLiP-ID']} OK")
-
             if i % CHECKPOINT_EVERY == 0:
                 flush_batch()
-
     flush_batch()
 
 except KeyboardInterrupt:
@@ -149,11 +164,14 @@ if not failed_df.empty:
             result = f.result()
             result["DLiP-ID"] = futures[f]
             batch_results.append(result)
-
             if i % CHECKPOINT_EVERY == 0:
                 flush_batch()
-
     flush_batch()
+
+# ---------- FINAL SORT AND SAVE ----------
+df = df.sort_values(by="DLiP-ID").reset_index(drop=True)
+df.to_csv(TSV_FILE, sep="\t", index=False)
+df.to_pickle(PKL_FILE)
 
 success_count = df[df["error"].isna()].shape[0]
 failure_count = df[df["error"].notna()].shape[0]
